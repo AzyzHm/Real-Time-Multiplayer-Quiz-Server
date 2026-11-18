@@ -35,6 +35,7 @@ DELIMITER = b"\n"    # end of one message
 JOIN = "JOIN"
 ANSWER = "ANSWER"
 QUIT = "QUIT"
+READY = "READY"      # sent when the client sees the lobby close: "start without waiting for me"
 
 # Server -> client message types
 WELCOME = "WELCOME"
