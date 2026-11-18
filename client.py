@@ -1,17 +1,18 @@
-"""Quiz console client, PHASE 2: join the lobby and follow it live.
+"""Quiz console client, PHASE 3: lobby, questions, answers, rankings.
 
 Usage: python client.py [server_ip] [port]
 
-The server can send a message at any time (for example when another player
-joins), while the main thread waits for the keyboard. So a small receiver
-thread displays the server messages as they arrive.
-Type any text to send it as a test ANSWER (rejected until phase 3),
-type 'quit' to leave.
+The server can send a message at any time (another player joins, a new
+question arrives...), while the main thread waits for the keyboard. So a
+small receiver thread handles the server messages as they arrive.
+During a question, type the letter of your answer (A, B, C, D).
+Type 'quit' to leave.
 """
 
 import socket
 import sys
 import threading
+from typing import Dict, Optional
 
 import protocol as p
 
@@ -28,6 +29,13 @@ class ConsoleClient:
         self._channel = None
         self._stop = threading.Event()           # set when the session is over
         self._last_lobby_version = 0             # to ignore stale lobby messages
+        self._ready_sent = False
+        # Question being asked. Written by the receiver thread, read and
+        # modified by the main thread: protected by this lock.
+        self._lock = threading.Lock()
+        self._question_id: Optional[int] = None  # None: no question at the moment
+        self._choices: Dict[str, str] = {}
+        self._answered = False
 
     def run(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -66,7 +74,7 @@ class ConsoleClient:
                 if reply is None:
                     print("Server closed the connection")
                     return False
-                self._show(reply)
+                self._handle(reply)
                 if reply["type"] == p.WELCOME:
                     return True
                 if reply["type"] == p.ERROR:
@@ -76,14 +84,15 @@ class ConsoleClient:
 
     # --------------------------------------------------------------- threads
     def _receive_loop(self) -> None:
-        """Receiver thread: display every message sent by the server."""
+        """Receiver thread: handle every message sent by the server."""
         try:
             while not self._stop.is_set():
                 message = self._channel.recv_message()
                 if message is None:
-                    print("\n[server] connection closed, press Enter to exit")
+                    if not self._stop.is_set():
+                        print("\n[server] connection closed, press Enter to exit")
                     break
-                self._show(message)
+                self._handle(message)
         except (p.ProtocolError, OSError) as exc:
             if not self._stop.is_set():
                 print(f"\n[server] connection problem: {exc}, press Enter to exit")
@@ -101,28 +110,91 @@ class ConsoleClient:
                 self._channel.send_message(p.make_message(p.QUIT))
                 break
             if text:
-                self._channel.send_message(
-                    p.make_message(p.ANSWER, q=0, choice=text.upper()))
+                self._answer(text.upper())
+
+    def _answer(self, choice: str) -> None:
+        """Send the answer to the current question (once)."""
+        with self._lock:                         # check-and-set, like the server does
+            question_id = self._question_id
+            if question_id is None:
+                problem = "No question right now"
+            elif self._answered:
+                problem = "You already answered this question"
+            elif choice not in self._choices:
+                problem = f"Choose one of: {', '.join(self._choices)}"
+            else:
+                self._answered = True
+                problem = None
+        if problem is not None:
+            print(problem)
+            return
+        # Sent AFTER the lock is released: never do network I/O under a lock
+        self._channel.send_message(p.make_message(p.ANSWER, q=question_id, choice=choice))
+        print("Answer sent, waiting for the others...")
 
     # --------------------------------------------------------------- display
-    def _show(self, message: dict) -> None:
-        """Display one server message. Only one thread at a time calls this:
-        the main thread during the handshake, then the receiver thread."""
+    def _handle(self, message: dict) -> None:
+        """Display one server message and react to it. Only one thread at a time
+        calls this: the main thread during the handshake, then the receiver."""
         msg_type = message["type"]
         if msg_type == p.WELCOME:
             print(f"[server] Welcome, you are player {message.get('player_id')}")
         elif msg_type == p.LOBBY:
-            version = message.get("version", 0)
-            if version <= self._last_lobby_version:
-                return                            # older than what we already show
-            self._last_lobby_version = version
-            status = "open" if message.get("open", True) else "CLOSED, game starting"
-            players = ", ".join(message.get("players", []))
-            print(f"[server] Lobby ({status}): {players}")
+            self._handle_lobby(message)
+        elif msg_type == p.QUESTION:
+            self._handle_question(message)
+        elif msg_type == p.RESULT:
+            self._handle_result(message)
+        elif msg_type == p.SCORES:
+            self._show_ranking("Ranking", message.get("ranking", []))
+        elif msg_type == p.GAME_OVER:
+            self._show_ranking("GAME OVER, final ranking", message.get("ranking", []))
+            self._stop.set()
+            self._channel.close()                # the server waits for us to close first
+            print("Press Enter to exit")
         elif msg_type == p.ERROR:
             print(f"[server] Error: {message.get('reason')}")
         else:
             print(f"[server] {message}")
+
+    def _handle_lobby(self, message: dict) -> None:
+        version = message.get("version", 0)
+        if version <= self._last_lobby_version:
+            return                                # older than what we already show
+        self._last_lobby_version = version
+        players = ", ".join(message.get("players", []))
+        if message.get("open", True):
+            print(f"[server] Lobby (open): {players}")
+            return
+        print(f"[server] Lobby closed, the game is starting: {players}")
+        if not self._ready_sent:                  # tell the server we can start
+            self._ready_sent = True
+            self._channel.send_message(p.make_message(p.READY))
+
+    def _handle_question(self, message: dict) -> None:
+        with self._lock:
+            self._choices = dict(message["choices"])
+            self._answered = False
+            self._question_id = message["q"]
+        print(f"\nQuestion {message.get('number')}/{message.get('total')} "
+              f"({message.get('time_limit')} s): {message['text']}")
+        for letter, text in message["choices"].items():
+            print(f"  {letter}) {text}")
+
+    def _handle_result(self, message: dict) -> None:
+        with self._lock:
+            self._question_id = None              # the round is over
+        if message.get("correct"):
+            bonus = " (first!)" if message.get("first") else ""
+            print(f"[result] Correct! +{message.get('points')}{bonus}")
+        else:
+            print(f"[result] No points. The answer was {message.get('answer')}")
+
+    @staticmethod
+    def _show_ranking(title: str, ranking: list) -> None:
+        print(f"[{title}]")
+        for position, (name, score) in enumerate(ranking, start=1):
+            print(f"  {position}. {name}: {score}")
 
 
 def main() -> None:
