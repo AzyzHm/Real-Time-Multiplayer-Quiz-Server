@@ -9,13 +9,20 @@ returns a message once a full line is available.
 json.dumps escapes newlines inside strings (as the two characters \\ and n),
 so the delimiter can never appear inside a message payload.
 
-Thread safety: a MessageChannel is meant to be used by ONE reader thread
-(the worker of that player). The buffer is not protected by a lock.
+Thread safety of a MessageChannel:
+  - Reading: ONE reader thread only (the worker of that player). The receive
+    buffer is not protected.
+  - Writing: any thread may call send_message(). A broadcast from worker A
+    can target the socket of worker B while B is also sending, so writes on
+    one socket are serialised by a small per-channel lock (_send_lock).
+    This lock is a "leaf" lock: nothing else is ever acquired while holding
+    it, so it cannot take part in a deadlock.
 """
 
 import json
 import socket
-from typing import Optional
+import threading
+from typing import Iterable, Optional
 
 # ---------------------------------------------------------------- constants
 HOST = ""            # empty string: reachable through any address of the machine
@@ -58,6 +65,7 @@ class MessageChannel:
     def __init__(self, sock: socket.socket) -> None:
         self._sock = sock
         self._buffer = b""   # bytes received but not yet returned as a message
+        self._send_lock = threading.Lock()   # one writer at a time on this socket
 
     def send_message(self, message: dict) -> None:
         """Send one message completely.
@@ -68,7 +76,8 @@ class MessageChannel:
         would block every other thread waiting for that lock.
         """
         data = json.dumps(message).encode(ENCODING) + DELIMITER
-        self._sock.sendall(data)
+        with self._send_lock:      # two threads must not interleave their bytes
+            self._sock.sendall(data)
 
     def recv_message(self) -> Optional[dict]:
         """Return the next message, or None if the peer closed the connection.
@@ -92,7 +101,16 @@ class MessageChannel:
         self._sock.settimeout(seconds)
 
     def close(self) -> None:
-        """Close the underlying socket."""
+        """Shut down and close the socket.
+
+        Safe to call several times and from another thread: shutdown() wakes
+        up a thread that is blocked in recv() on this socket (it then gets
+        b"" and recv_message() returns None).
+        """
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass                   # already closed, or never connected
         self._sock.close()
 
     @staticmethod
@@ -105,3 +123,17 @@ class MessageChannel:
         if not isinstance(message, dict) or "type" not in message:
             raise ProtocolError(f"message without a type: {line!r}")
         return message
+
+
+def broadcast(channels: Iterable[MessageChannel], message: dict) -> None:
+    """Send one message to several channels (1 to N, as in the course).
+
+    A channel that fails is skipped: the worker thread of that player will
+    notice the broken connection by itself and clean up.
+    Call this OUTSIDE the game state lock.
+    """
+    for channel in channels:
+        try:
+            channel.send_message(message)
+        except OSError:
+            pass

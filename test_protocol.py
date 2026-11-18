@@ -1,6 +1,7 @@
 """Tests of the framing in protocol.py (run: python test_protocol.py)."""
 
 import socket
+import threading
 import unittest
 
 import protocol as p
@@ -62,6 +63,28 @@ class FramingTest(unittest.TestCase):
             self.receiver.recv_message()
         self.a.sendall(b'IT"}\n')
         self.assertEqual(self.receiver.recv_message(), {"type": "QUIT"})
+
+    def test_concurrent_senders_do_not_mix_their_bytes(self) -> None:
+        """Several threads write to the SAME channel (a broadcast does that)."""
+        senders, per_sender, size = 6, 100, 3000
+        payload = "x" * size
+
+        def send_many(sender_id: int) -> None:
+            for n in range(per_sender):
+                self.sender.send_message(
+                    p.make_message("TEST", sender=sender_id, n=n, data=payload))
+
+        threads = [threading.Thread(target=send_many, args=(i,)) for i in range(senders)]
+        for t in threads:
+            t.start()
+        received = [self.receiver.recv_message() for _ in range(senders * per_sender)]
+        for t in threads:
+            t.join()
+
+        self.assertTrue(all(m["data"] == payload for m in received))
+        for sender_id in range(senders):              # per-sender order is kept
+            seen = [m["n"] for m in received if m["sender"] == sender_id]
+            self.assertEqual(seen, list(range(per_sender)))
 
 
 if __name__ == "__main__":
