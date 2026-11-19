@@ -93,9 +93,11 @@ class ClientWorker(threading.Thread):
                 return
             outcome = self._state.remove_player(self._player.player_id)
             if outcome is Leave.REMOVED:
+                self._state.publish_event({"type": "leave",
+                                           "player": self._player.name})
                 broadcast_lobby(self._state)
             elif outcome is Leave.GHOST and not self._game_played:
-                self._connected = False
+                self._mark_ghost()
                 self._play_game()
         finally:
             self._channel.close()
@@ -126,6 +128,7 @@ class ClientWorker(threading.Thread):
             return
 
         print(f"[{self.name}] joined as {self._player.name}")
+        self._state.publish_event({"type": "join", "player": self._player.name})
         self._channel.send_message(
             p.make_message(p.WELCOME, player_id=self._player.player_id))
         broadcast_lobby(self._state)
@@ -164,6 +167,9 @@ class ClientWorker(threading.Thread):
         state.start_barrier.wait()          # everybody ready. Action: pick the question
         info = state.round_info()
         result = self._ask_question(info) if self._connected else None
+        if result is None and self._connected:       # time is over, still connected
+            state.publish_event({"type": "timeout", "player": self._player.name,
+                                 "q": info.question_id})
         state.end_barrier.wait()            # everybody answered or timed out. Action: freeze ranking
         self._send_round_summary(info, result)
 
@@ -210,7 +216,12 @@ class ClientWorker(threading.Thread):
             except RoundError as exc:
                 self._send_game(p.make_message(p.ERROR, reason=exc.reason))
                 continue
-            # PHASE 4: push the "answer" event to the logger queue here
+            # The lock is released: now tell the logger process (mp.Queue)
+            self._state.publish_event({
+                "type": "answer", "player": self._player.name,
+                "q": info.question_id, "correct": result.correct,
+                "points": result.points, "first": result.first,
+                "t": round(result.response_time, 3)})
             return result
 
     def _send_round_summary(self, info: RoundInfo,
@@ -255,4 +266,6 @@ class ClientWorker(threading.Thread):
         self._connected = False
         if self._player is not None:
             self._state.remove_player(self._player.player_id)   # -> Leave.GHOST
+            self._state.publish_event({"type": "disconnect",
+                                       "player": self._player.name})
         self._channel.close()
