@@ -1,4 +1,8 @@
-"""Quiz server, PHASE 3: lobby + full game (rounds, scoring, barriers).
+"""Quiz server, PHASE 4: lobby + full game + logger/leaderboard process.
+
+Processes:
+  - server process  : everything below
+  - logger process  : receives events through an mp.Queue (logger_process.py)
 
 Threads of the server process:
   - main thread     : the host console (commands: list, start, quit)
@@ -19,18 +23,21 @@ from typing import List, Optional
 
 import protocol as p
 from game_state import GameState, LobbyError, Question, load_questions
+from logger_process import GameLogger
 from worker import ClientWorker, broadcast_lobby
 
 ACCEPT_TIMEOUT = 0.5   # seconds: lets the listener check the stop flag regularly
-QUESTIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              "questions.json")
+HERE = os.path.dirname(os.path.abspath(__file__))
+QUESTIONS_FILE = os.path.join(HERE, "questions.json")
+LOG_FILE = os.path.join(HERE, "game.log")
 
 
 class QuizServer:
     """Listens on a TCP port and serves many clients at the same time."""
 
     def __init__(self, host: str = p.HOST, port: int = p.PORT,
-                 questions: Optional[List[Question]] = None) -> None:
+                 questions: Optional[List[Question]] = None,
+                 logger: Optional[GameLogger] = None) -> None:
         self._host = host
         self._port = port
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -38,7 +45,9 @@ class QuizServer:
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         # Set when the game is over: every worker has finished its game
         self._done = threading.Event()
-        self._state = GameState(questions, finished=self._done)
+        self._logger = logger                   # None: no logging at all
+        self._state = GameState(questions, finished=self._done,
+                                publish=self._publish)
         self._stop = threading.Event()          # shared stop flag for the listener
         self._listener_thread: Optional[threading.Thread] = None
         # Only the listener thread touches this list while the server runs.
@@ -50,15 +59,31 @@ class QuizServer:
         """Real port in use (useful when the server was created with port 0)."""
         return self._listener.getsockname()[1]
 
+    def _publish(self, event: dict) -> None:
+        """Send an event to the logger process, if there is one."""
+        if self._logger is not None:
+            self._logger.publish(event)
+
     def wait_until_done(self, timeout: Optional[float] = None) -> bool:
         """Block until the game is over (True) or the timeout expires (False)."""
         return self._done.wait(timeout)
 
     # ----------------------------------------------------------- life cycle
     def start(self) -> None:
-        """Bind, listen and start the listener thread. Raises OSError if bind fails."""
-        self._listener.bind((self._host, self._port))
-        self._listener.listen(5)
+        """Start the logger process, bind, listen, start the listener thread.
+
+        Raises OSError if the log file cannot be opened or the bind fails.
+        The logger process is created BEFORE any thread of the server exists.
+        """
+        if self._logger is not None:
+            self._logger.start()
+        try:
+            self._listener.bind((self._host, self._port))
+            self._listener.listen(5)
+        except OSError:
+            if self._logger is not None:
+                self._logger.stop()
+            raise
         self._listener_thread = threading.Thread(target=self._accept_loop,
                                                  name="listener")
         self._listener_thread.start()
@@ -72,14 +97,16 @@ class QuizServer:
         for worker in self._workers:
             worker.disconnect()                  # closing the socket wakes up recv()
         for worker in self._workers:
-            worker.join()
+            worker.join()                        # no thread publishes events any more
+        if self._logger is not None:
+            self._logger.stop()                  # sentinel None, then join the process
 
     def run(self) -> None:
         """Start the server and run the host console until 'quit' or Ctrl+C."""
         try:
             self.start()
         except OSError as exc:
-            print(f"Cannot bind port {self._port}: {exc}")
+            print(f"Cannot start the server: {exc}")
             return
         print(f"Server listening on port {self.port}")
         print("Host commands: list, start, quit")
@@ -137,13 +164,20 @@ class QuizServer:
                 print("Commands: list, start, quit")
 
     def _announce_end(self) -> None:
-        """Daemon thread: wait for the end of the game and print the ranking."""
+        """Daemon thread: wait for the end of the game and tell the host.
+
+        With a logger, the final ranking and statistics are printed by the
+        logger process (leaderboard role). Without one, print the ranking here.
+        """
         self._done.wait()
         if self._stop.is_set():
             return                               # the host is quitting: stay silent
-        print("\nGame over. Final ranking:")
-        for position, (name, score) in enumerate(self._state.frozen_ranking(), start=1):
-            print(f"  {position}. {name}: {score}")
+        if self._logger is None:
+            print("\nGame over. Final ranking:")
+            for position, (name, score) in enumerate(self._state.frozen_ranking(), start=1):
+                print(f"  {position}. {name}: {score}")
+        else:
+            print("\nGame over.")
         print("Type quit to stop the server.")
 
     def start_game(self) -> bool:
@@ -161,15 +195,17 @@ class QuizServer:
             print(f"Cannot start: {exc.reason}")
             return False
         broadcast_lobby(self._state)             # clients see that the lobby is closed
+        self._publish({"type": "game_start", "players": names,
+                       "questions": self._state.total_rounds})
         print(f"Lobby closed with {len(names)} players: {', '.join(names)}")
         return True
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":      # this guard is mandatory with multiprocessing (spawn)
     try:
         loaded = load_questions(QUESTIONS_FILE)
     except (OSError, ValueError) as exc:
         print(f"Cannot load {QUESTIONS_FILE}: {exc}")
         sys.exit(1)
-    print(f"{len(loaded)} questions loaded")
-    QuizServer(questions=loaded).run()
+    print(f"{len(loaded)} questions loaded, log file: {LOG_FILE}")
+    QuizServer(questions=loaded, logger=GameLogger(LOG_FILE)).run()
