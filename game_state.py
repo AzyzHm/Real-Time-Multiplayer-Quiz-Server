@@ -23,7 +23,7 @@ import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, Iterable, List, NamedTuple, Optional
+from typing import Callable, Dict, Iterable, List, NamedTuple, Optional
 
 from protocol import MessageChannel
 
@@ -136,8 +136,10 @@ class GameState:
 
     def __init__(self, questions: Optional[Iterable[Question]] = None,
                  min_players: int = MIN_PLAYERS, max_players: int = MAX_PLAYERS,
-                 finished: Optional[threading.Event] = None) -> None:
+                 finished: Optional[threading.Event] = None,
+                 publish: Optional[Callable[[dict], None]] = None) -> None:
         self._lock = threading.Lock()          # the ONE lock of the game
+        self._publish = publish                # sends an event to the logger process
         self._min_players = min_players
         self._max_players = max_players
         self._questions: List[Question] = list(questions or [])
@@ -179,6 +181,16 @@ class GameState:
     def is_started(self) -> bool:
         with self._lock:
             return not self._lobby_open
+
+    def publish_event(self, event: dict) -> None:
+        """Hand an event to the logger process (if there is one).
+
+        Deliberately NOT under the lock: callers build the event under the
+        lock if needed, release it, then publish. The callback only puts a
+        picklable dict in an mp.Queue (thread-safe, does not block).
+        """
+        if self._publish is not None:
+            self._publish(event)
 
     # ------------------------------------------------------------ lobby
     def add_player(self, name: str, channel: MessageChannel) -> Player:
@@ -285,6 +297,10 @@ class GameState:
         """
         with self._lock:
             self._frozen_ranking = self._ranking()
+            event = {"type": "round_end", "q": self._current.id,
+                     "number": self._next_index, "total": len(self._questions),
+                     "ranking": [entry[:] for entry in self._frozen_ranking]}
+        self.publish_event(event)               # after the lock is released
 
     # ------------------------------------------------------------ rounds
     def round_info(self) -> RoundInfo:
@@ -348,8 +364,16 @@ class GameState:
 
     # ------------------------------------------------------------ end of game
     def player_done(self) -> None:
-        """A worker finished its game. The last one sets the `finished` event."""
+        """A worker finished its game. The last one ends the game.
+
+        The last worker publishes "game_over" BEFORE setting `finished`. The
+        server joins every worker before it stops the logger, so this event
+        always reaches the queue before the end sentinel.
+        """
         with self._lock:
             self._done_count += 1
-            if self._done_count >= len(self._players):
-                self._finished.set()
+            last = self._done_count >= len(self._players)
+            ranking = [e[:] for e in (self._frozen_ranking or self._ranking())]
+        if last:
+            self.publish_event({"type": "game_over", "ranking": ranking})
+            self._finished.set()
