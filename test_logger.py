@@ -127,6 +127,14 @@ class LoggerProcessTest(unittest.TestCase):
         self.logger.stop()
         self.assertNotIn("Final statistics", "\n".join(self.lines()))
 
+    def test_quiet_logger_still_writes_the_file(self) -> None:
+        quiet = GameLogger(self.path, quiet=True)
+        quiet.start()
+        quiet.publish({"type": "join", "player": "Ali"})
+        quiet.stop()
+        self.assertEqual(quiet.exitcode, 0)
+        self.assertIn("player=Ali", "\n".join(self.lines()))
+
     def test_log_file_is_appended(self) -> None:
         for _ in range(2):
             logger = GameLogger(self.path)
@@ -191,6 +199,7 @@ class LoggedGameTest(unittest.TestCase):
         self.assertEqual(self.kinds(text, "join"), 2)
         self.assertEqual(self.kinds(text, "game_start"), 1)
         self.assertEqual(self.kinds(text, "answer"), 4)        # 2 players x 2 questions
+        self.assertEqual(self.kinds(text, "round_start"), 2)
         self.assertEqual(self.kinds(text, "round_end"), 2)
         self.assertEqual(self.kinds(text, "game_over"), 1)
         self.assertEqual(text.count("=== Final statistics ==="), 1)

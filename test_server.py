@@ -7,10 +7,13 @@ import socket
 import threading
 import time
 import unittest
+from unittest import mock
 
 import protocol as p
 from game_state import Question
+from host_display import HostDisplay
 from server import QuizServer
+from worker import ClientWorker
 
 QUESTIONS = [
     Question(1, "First?", {"A": "a", "B": "b", "C": "c", "D": "d"}, "B", 1.5),
@@ -156,16 +159,19 @@ class Bot(threading.Thread):
     delay:   seconds to wait before answering
     leave_after_question: close the socket as soon as the first question arrives
     leave_when_closed:    close the socket as soon as the lobby closes (no READY)
+    no_ready:             stay connected but never answer READY (a frozen client)
     """
 
     def __init__(self, port, name, answers=None, delay=0.0,
-                 leave_after_question=False, leave_when_closed=False):
+                 leave_after_question=False, leave_when_closed=False,
+                 no_ready=False):
         super().__init__(name=f"bot-{name}")
         self.port, self.player = port, name
         self.answers = GOOD if answers is None else answers
         self.delay = delay
         self.leave_after_question = leave_after_question
         self.leave_when_closed = leave_when_closed
+        self.no_ready = no_ready
         self.joined = threading.Event()
         self.messages = []
 
@@ -184,7 +190,8 @@ class Bot(threading.Thread):
                 elif kind == p.LOBBY and not message["open"]:
                     if self.leave_when_closed:
                         return
-                    channel.send_message(p.make_message(p.READY))
+                    if not self.no_ready:
+                        channel.send_message(p.make_message(p.READY))
                 elif kind == p.QUESTION:
                     if self.leave_after_question:
                         return
@@ -203,6 +210,21 @@ class Bot(threading.Thread):
         return [m for m in self.messages if m["type"] == msg_type]
 
 
+def run_bots(test: unittest.TestCase, server: QuizServer, bots, timeout: float = 15) -> None:
+    """Start the bots, wait until they all joined, start the game (unless the
+    server starts it by itself), wait for the end."""
+    for bot in bots:
+        bot.port = server.port
+        bot.start()
+        test.assertTrue(bot.joined.wait(5))       # sequential joins: stable order
+    if server._autostart is None:
+        test.assertTrue(server.start_game())
+    test.assertTrue(server.wait_until_done(timeout), "the game did not finish")
+    for bot in bots:
+        bot.join(5)
+        test.assertFalse(bot.is_alive())
+
+
 class GameTest(unittest.TestCase):
     def setUp(self) -> None:
         self.server = QuizServer("127.0.0.1", 0, QUESTIONS)
@@ -212,15 +234,7 @@ class GameTest(unittest.TestCase):
         self.server.stop()
 
     def play(self, *bots: Bot, timeout: float = 15) -> None:
-        """Start the bots, wait until they all joined, start the game, wait for the end."""
-        for bot in bots:
-            bot.start()
-            self.assertTrue(bot.joined.wait(5))   # sequential joins: stable order
-        self.assertTrue(self.server.start_game())
-        self.assertTrue(self.server.wait_until_done(timeout), "the game did not finish")
-        for bot in bots:
-            bot.join(5)
-            self.assertFalse(bot.is_alive())
+        run_bots(self, self.server, bots, timeout)
 
     def test_full_game_with_two_players(self) -> None:
         port = self.server.port
@@ -294,6 +308,76 @@ class GameTest(unittest.TestCase):
         bots = [Bot(port, "A", leave_when_closed=True),
                 Bot(port, "B", leave_when_closed=True)]
         self.play(*bots)                                 # play() fails if the game hangs
+
+
+class RobustnessTest(unittest.TestCase):
+    def make_server(self, **options) -> QuizServer:
+        server = QuizServer("127.0.0.1", 0, QUESTIONS, **options)
+        server.start()
+        self.addCleanup(server.stop)
+        return server
+
+    def test_frozen_client_is_removed_after_the_ready_deadline(self) -> None:
+        """A client that stays connected but never answers READY must not block
+        the first barrier until its timeout (which would abort the game)."""
+        server = self.make_server(ready_timeout=1.0)
+        ali = Bot(0, "Ali")
+        frozen = Bot(0, "Frozen", no_ready=True)
+        started = time.monotonic()
+        run_bots(self, server, [ali, frozen])
+        elapsed = time.monotonic() - started
+        self.assertGreater(elapsed, 0.9)                   # waited for the deadline
+        self.assertLess(elapsed, 8)                        # not for the barrier timeout (21 s)
+        self.assertEqual(ali.of_type(p.GAME_OVER)[0]["ranking"],
+                         [["Ali", 300], ["Frozen", 0]])
+        self.assertEqual(frozen.of_type(p.QUESTION), [])   # it never played
+
+    def test_a_crashing_worker_aborts_the_game_quickly(self) -> None:
+        """If a worker thread has a bug, the others must not wait for it until
+        the barrier timeout: abort_game() breaks the barriers at once."""
+        server = self.make_server()
+        original = ClientWorker._ask_question
+
+        def faulty(worker, info):
+            if worker._player.name == "Bad":
+                raise RuntimeError("simulated bug")
+            return original(worker, info)
+
+        ali = Bot(0, "Ali")
+        bad = Bot(0, "Bad")
+        started = time.monotonic()
+        with mock.patch.object(ClientWorker, "_ask_question", faulty):
+            run_bots(self, server, [ali, bad], timeout=10)
+        self.assertLess(time.monotonic() - started, 8)
+        reasons = [m["reason"] for m in ali.of_type(p.ERROR)]
+        self.assertIn("game aborted", reasons)
+
+    def test_game_starts_by_itself_with_autostart(self) -> None:
+        server = self.make_server(autostart=2)
+        ali, sana = Bot(0, "Ali"), Bot(0, "Sana", delay=0.2)
+        run_bots(self, server, [ali, sana])                # nobody calls start_game()
+        self.assertEqual(len(ali.of_type(p.GAME_OVER)), 1)
+
+    def test_autostart_waits_for_enough_players(self) -> None:
+        server = self.make_server(autostart=3)
+        ali, sana = Bot(server.port, "Ali"), Bot(server.port, "Sana")
+        for bot in (ali, sana):
+            bot.start()
+            self.assertTrue(bot.joined.wait(5))
+        self.assertFalse(server.wait_until_done(1.0))      # 2 players: not started
+        self.assertEqual(ali.of_type(p.QUESTION), [])
+        eya = Bot(server.port, "Eya")
+        eya.start()
+        self.assertTrue(server.wait_until_done(15))
+        for bot in (ali, sana, eya):
+            bot.join(5)
+
+    def test_countdown_display_runs_during_the_game_and_stops_with_the_server(self) -> None:
+        server = self.make_server(display=HostDisplay())
+        run_bots(self, server, [Bot(0, "Ali"), Bot(0, "Sana")])
+        self.assertTrue([t for t in threading.enumerate() if t.name == "countdown"])
+        server.stop()
+        self.assertEqual([t for t in threading.enumerate() if t.name == "countdown"], [])
 
 
 if __name__ == "__main__":

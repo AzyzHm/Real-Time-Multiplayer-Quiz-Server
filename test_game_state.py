@@ -221,5 +221,113 @@ class ScoringConcurrencyTest(unittest.TestCase):
             self.assertEqual(total, players * POINTS_CORRECT + BONUS_FIRST)
 
 
+class UnsafeModeTest(unittest.TestCase):
+    """The race condition demo: the same code, without the lock."""
+
+    def count_bonuses(self, safe: bool, players: int = 20) -> int:
+        state = GameState(QUESTIONS, max_players=players, safe=safe)
+        for i in range(players):
+            state.add_player(f"p{i}", None)
+        state.close_lobby()
+        pass_barrier(state.start_barrier, players)
+        gate = threading.Barrier(players)
+        results = [None] * players
+
+        def answer(i: int) -> None:
+            gate.wait()
+            results[i] = state.submit_answer(i + 1, 1, "B")
+
+        threads = [threading.Thread(target=answer, args=(i,)) for i in range(players)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return sum(r.first for r in results)
+
+    def test_unsafe_mode_gives_several_bonuses(self) -> None:
+        counts = [self.count_bonuses(safe=False) for _ in range(5)]
+        self.assertTrue(any(c > 1 for c in counts), f"no race seen: {counts}")
+
+    def test_safe_mode_always_gives_one_bonus(self) -> None:
+        self.assertEqual({self.count_bonuses(safe=True) for _ in range(5)}, {1})
+
+
+class WaitingTest(unittest.TestCase):
+    def test_wait_for_players_wakes_up_when_the_count_is_reached(self) -> None:
+        state = GameState(max_players=6)
+        outcome = []
+        waiter = threading.Thread(target=lambda: outcome.append(state.wait_for_players(3)))
+        waiter.start()
+        for name in ("a", "b"):
+            state.add_player(name, None)
+        waiter.join(0.3)
+        self.assertTrue(waiter.is_alive())               # 2 players: still waiting
+        state.add_player("c", None)
+        waiter.join(2)
+        self.assertEqual(outcome, [True])
+
+    def test_wait_for_players_returns_false_if_the_lobby_closes(self) -> None:
+        state = GameState()
+        outcome = []
+        waiter = threading.Thread(target=lambda: outcome.append(state.wait_for_players(5)))
+        waiter.start()
+        state.add_player("a", None)
+        state.add_player("b", None)
+        state.close_lobby()                              # the host started first
+        waiter.join(2)
+        self.assertEqual(outcome, [False])
+
+    def test_wait_for_players_returns_at_once_if_already_enough(self) -> None:
+        state = GameState()
+        state.add_player("a", None)
+        self.assertTrue(state.wait_for_players(1))
+
+
+class ReadyAndAbortTest(unittest.TestCase):
+    def test_unready_players(self) -> None:
+        state = started_game(3)
+        state.mark_ready(2)
+        self.assertEqual([name for name, _ in state.unready_players()], ["p1", "p3"])
+        state.remove_player(1)                           # ghost: no longer concerned
+        self.assertEqual([name for name, _ in state.unready_players()], ["p3"])
+
+    def test_abort_game_wakes_up_waiting_workers(self) -> None:
+        state = started_game(3)
+        errors = []
+
+        def worker() -> None:
+            try:
+                state.start_barrier.wait()
+            except threading.BrokenBarrierError:
+                errors.append(1)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]   # 1 party missing
+        for t in threads:
+            t.start()
+        state.abort_game()
+        for t in threads:
+            t.join(2)
+        self.assertEqual(len(errors), 2)
+
+
+class EventsTest(unittest.TestCase):
+    def test_events_are_published_outside_the_lock_and_in_order(self) -> None:
+        events = []
+        state = GameState(QUESTIONS, publish=events.append)
+        state.add_player("a", None)
+        state.add_player("b", None)
+        state.close_lobby()
+        pass_barrier(state.start_barrier, 2)
+        state.submit_answer(1, 1, "B")
+        pass_barrier(state.end_barrier, 2)
+        state.player_done()
+        state.player_done()
+        self.assertEqual([e["type"] for e in events], ["round_start", "round_end", "game_over"])
+        self.assertEqual((events[0]["number"], events[0]["total"], events[0]["time_limit"]),
+                         (1, 2, 5))
+        self.assertEqual(events[1]["ranking"], [["a", 150], ["b", 0]])
+        self.assertEqual(events[2]["ranking"], [["a", 150], ["b", 0]])
+
+
 if __name__ == "__main__":
     unittest.main()
