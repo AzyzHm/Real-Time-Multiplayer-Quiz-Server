@@ -18,6 +18,7 @@ Life of a worker:
 import socket
 import threading
 import time
+import traceback
 from typing import Optional, Tuple
 
 import protocol as p
@@ -137,6 +138,7 @@ class ClientWorker(threading.Thread):
         if self._player is None or not self._state.is_started():
             self._send_error("game not started")
             return False
+        self._state.mark_ready(self._player.player_id)   # the server's READY deadline
         self._play_game()
         return True
 
@@ -159,6 +161,12 @@ class ClientWorker(threading.Thread):
             # worker gets this error at the same moment, so all stop together.
             print(f"[{self.name}] barrier broken, game aborted")
             self._send_game(p.make_message(p.ERROR, reason="game aborted"))
+        except Exception:
+            # Last safety net: a bug in this worker. The other workers must not
+            # wait for it until the barrier timeout, so break the barriers now:
+            # they all get BrokenBarrierError at once and stop together.
+            traceback.print_exc()
+            self._state.abort_game()
         finally:
             self._state.player_done()
 
