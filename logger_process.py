@@ -22,6 +22,7 @@ Types: join, leave, game_start, answer, timeout, disconnect, round_end, game_ove
 import multiprocessing as mp
 import queue
 import signal
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -109,6 +110,17 @@ class GameStats:
         return lines
 
 
+def console_line(text: str) -> None:
+    """Print one full line on the console.
+
+    The host console may be showing a countdown (host_display.py) on the
+    current line. On a real terminal, wipe that line first so the two outputs
+    do not mix. The countdown redraws itself a moment later.
+    """
+    wipe = "\r" + " " * 79 + "\r" if sys.stdout.isatty() else ""
+    print(wipe + text, flush=True)
+
+
 # ---------------------------------------------------------------- formatting
 def format_event(event: dict) -> str:
     """One log line: time, event type, then key=value pairs."""
@@ -134,10 +146,11 @@ def format_live_ranking(event: dict) -> str:
 
 
 # ------------------------------------------------------------ process body
-def run_logger(events, log_path: str) -> None:
+def run_logger(events, log_path: str, quiet: bool = False) -> None:
     """Body of the logger process (a module-level function: with the "spawn"
     start method, used on Windows and macOS, the target must be importable
-    and its arguments picklable)."""
+    and its arguments picklable). With quiet=True nothing is printed on the
+    console (used by the benchmark); the log file is written anyway."""
     # Ctrl+C in the terminal reaches every process of the group. The server
     # stops this process cleanly with the sentinel, so ignore SIGINT here.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -154,7 +167,8 @@ def run_logger(events, log_path: str) -> None:
         def report() -> None:
             for line in stats.report():
                 write(line)
-                print(line, flush=True)
+                if not quiet:
+                    console_line(line)
 
         write(f"=== Quiz log started {time.strftime('%Y-%m-%d %H:%M:%S')} ===")
         while True:
@@ -172,8 +186,8 @@ def run_logger(events, log_path: str) -> None:
             write(format_event(event))
             stats.add(event)
             kind = event.get("type")
-            if kind == "round_end":
-                print(format_live_ranking(event), flush=True)
+            if kind == "round_end" and not quiet:
+                console_line(format_live_ranking(event))
             elif kind == "game_over" and not reported:
                 report()
                 reported = True
@@ -191,13 +205,13 @@ class GameLogger:
     does not block: a hidden feeder thread of the queue writes in the pipe).
     """
 
-    def __init__(self, log_path: str) -> None:
+    def __init__(self, log_path: str, quiet: bool = False) -> None:
         self._log_path = log_path
         context = mp.get_context("spawn")        # same behaviour on every OS
         self._events = context.Queue()
         # daemon: if the server crashes, the logger does not outlive it
         self._process = context.Process(target=run_logger,
-                                        args=(self._events, log_path),
+                                        args=(self._events, log_path, quiet),
                                         name="logger", daemon=True)
         self._running = False
 
