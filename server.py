@@ -1,4 +1,4 @@
-"""Quiz server, PHASE 4: lobby + full game + logger/leaderboard process.
+"""Quiz server, PHASE 5: lobby + game + logger process + demo and robustness options.
 
 Processes:
   - server process  : everything below
@@ -10,11 +10,18 @@ Threads of the server process:
                       connection, then goes back to accept()
   - worker threads  : one per client, see worker.py
   - end watcher     : daemon thread that announces the end of the game
+  - autostart       : optional daemon thread, waits on a Condition (--autostart)
+  - ready timer     : threading.Timer, removes players who never answer READY
+  - countdown       : optional daemon threads running asyncio (--countdown)
 
 The shared data (players, scores, round data) lives in GameState, protected
 by ONE lock.
+
+Usage: python server.py [--port N] [--max-players N] [--autostart N]
+                        [--countdown] [--unsafe]
 """
 
+import argparse
 import os
 import socket
 import sys
@@ -22,11 +29,15 @@ import threading
 from typing import List, Optional
 
 import protocol as p
-from game_state import GameState, LobbyError, Question, load_questions
+from game_state import (MAX_PLAYERS, MIN_PLAYERS, GameState, LobbyError,
+                        Question, load_questions)
+from host_display import HostDisplay
 from logger_process import GameLogger
 from worker import ClientWorker, broadcast_lobby
 
-ACCEPT_TIMEOUT = 0.5   # seconds: lets the listener check the stop flag regularly
+ACCEPT_TIMEOUT = 0.5    # seconds: lets the listener check the stop flag regularly
+LISTEN_BACKLOG = 50     # waiting connections (a stress test connects many bots at once)
+READY_TIMEOUT = 10.0    # seconds a client has to answer READY after the lobby closed
 HERE = os.path.dirname(os.path.abspath(__file__))
 QUESTIONS_FILE = os.path.join(HERE, "questions.json")
 LOG_FILE = os.path.join(HERE, "game.log")
@@ -37,7 +48,11 @@ class QuizServer:
 
     def __init__(self, host: str = p.HOST, port: int = p.PORT,
                  questions: Optional[List[Question]] = None,
-                 logger: Optional[GameLogger] = None) -> None:
+                 logger: Optional[GameLogger] = None, *,
+                 max_players: int = MAX_PLAYERS, safe: bool = True,
+                 autostart: Optional[int] = None,
+                 display: Optional[HostDisplay] = None,
+                 ready_timeout: float = READY_TIMEOUT) -> None:
         self._host = host
         self._port = port
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -46,8 +61,14 @@ class QuizServer:
         # Set when the game is over: every worker has finished its game
         self._done = threading.Event()
         self._logger = logger                   # None: no logging at all
-        self._state = GameState(questions, finished=self._done,
-                                publish=self._publish)
+        self._display = display                 # None: no countdown
+        self._autostart = autostart
+        self._ready_timeout = ready_timeout
+        self._ready_timer: Optional[threading.Timer] = None
+        self._safe = safe
+        self._state = GameState(questions, max_players=max_players,
+                                finished=self._done, publish=self._publish,
+                                safe=safe)
         self._stop = threading.Event()          # shared stop flag for the listener
         self._listener_thread: Optional[threading.Thread] = None
         # Only the listener thread touches this list while the server runs.
@@ -60,9 +81,19 @@ class QuizServer:
         return self._listener.getsockname()[1]
 
     def _publish(self, event: dict) -> None:
-        """Send an event to the logger process, if there is one."""
+        """Receive every event of the game: logger process and countdown."""
         if self._logger is not None:
             self._logger.publish(event)
+        if self._display is not None:
+            kind = event.get("type")
+            try:
+                if kind == "round_start":
+                    self._display.start_round(event["number"], event["total"],
+                                              event["time_limit"])
+                elif kind in ("round_end", "game_over"):
+                    self._display.end_round()
+            except Exception as exc:             # a display problem must never stop the game
+                print(f"[display] {exc}")
 
     def wait_until_done(self, timeout: Optional[float] = None) -> bool:
         """Block until the game is over (True) or the timeout expires (False)."""
@@ -79,18 +110,28 @@ class QuizServer:
             self._logger.start()
         try:
             self._listener.bind((self._host, self._port))
-            self._listener.listen(5)
+            self._listener.listen(LISTEN_BACKLOG)
         except OSError:
             if self._logger is not None:
                 self._logger.stop()
             raise
+        if self._display is not None:
+            self._display.start()                # one daemon thread for the whole game
+        if not self._safe:
+            print("WARNING: UNSAFE MODE. The lock around the scoring is disabled "
+                  "(race condition demo). Do not use for a real game.")
         self._listener_thread = threading.Thread(target=self._accept_loop,
                                                  name="listener")
         self._listener_thread.start()
+        if self._autostart is not None:
+            threading.Thread(target=self._autostart_loop, name="autostart",
+                             daemon=True).start()
 
     def stop(self) -> None:
         """Clean shutdown: stop the listener, wake up the workers, join everything."""
         self._stop.set()
+        if self._ready_timer is not None:
+            self._ready_timer.cancel()
         if self._listener_thread is not None:
             self._listener_thread.join()         # no more worker is created after this
         self._listener.close()
@@ -98,6 +139,8 @@ class QuizServer:
             worker.disconnect()                  # closing the socket wakes up recv()
         for worker in self._workers:
             worker.join()                        # no thread publishes events any more
+        if self._display is not None:
+            self._display.close()                # erases its line, joins its thread
         if self._logger is not None:
             self._logger.stop()                  # sentinel None, then join the process
 
@@ -109,6 +152,8 @@ class QuizServer:
             print(f"Cannot start the server: {exc}")
             return
         print(f"Server listening on port {self.port}")
+        if self._autostart is not None:
+            print(f"The game starts when {self._autostart} players have joined")
         print("Host commands: list, start, quit")
 
         # Daemon: it only waits on an Event, so it can never block the exit.
@@ -172,6 +217,8 @@ class QuizServer:
         self._done.wait()
         if self._stop.is_set():
             return                               # the host is quitting: stay silent
+        if self._display is not None:
+            self._display.close()                # the countdown line is erased first
         if self._logger is None:
             print("\nGame over. Final ranking:")
             for position, (name, score) in enumerate(self._state.frozen_ranking(), start=1):
@@ -180,11 +227,22 @@ class QuizServer:
             print("\nGame over.")
         print("Type quit to stop the server.")
 
+    def _autostart_loop(self) -> None:
+        """Daemon thread (--autostart): start the game when enough players joined.
+
+        wait_for_players() sleeps on a Condition, so there is no busy waiting.
+        """
+        if self._state.wait_for_players(self._autostart):
+            self.start_game()
+
+    # ---------------------------------------------------------------- the game
     def start_game(self) -> bool:
         """Close the lobby. Returns False (and says why) if it cannot start.
 
         close_lobby() creates the two barriers. The players then receive the
         closed lobby, answer READY, and their workers run the rounds.
+        A timer removes the players who never answer READY, so that one
+        frozen client cannot hold up the first barrier.
         """
         if self._state.total_rounds == 0:
             print("Cannot start: no questions loaded")
@@ -198,14 +256,49 @@ class QuizServer:
         self._publish({"type": "game_start", "players": names,
                        "questions": self._state.total_rounds})
         print(f"Lobby closed with {len(names)} players: {', '.join(names)}")
+
+        self._ready_timer = threading.Timer(self._ready_timeout, self._kick_unready)
+        self._ready_timer.daemon = True
+        self._ready_timer.start()
         return True
 
+    def _kick_unready(self) -> None:
+        """Timer thread: drop the players who did not answer READY in time.
 
-if __name__ == "__main__":      # this guard is mandatory with multiprocessing (spawn)
+        Closing the socket wakes up the worker blocked in recv(); it then turns
+        into a ghost (see worker.py), so the barriers keep their parties.
+        """
+        for name, channel in self._state.unready_players():
+            print(f"{name} did not answer READY in time, removed from the game")
+            channel.close()
+
+
+def main(argv=None) -> None:
+    parser = argparse.ArgumentParser(description="Real-time multiplayer quiz server")
+    parser.add_argument("--port", type=int, default=p.PORT)
+    parser.add_argument("--max-players", type=int, default=MAX_PLAYERS,
+                        help=f"size of the lobby (default {MAX_PLAYERS})")
+    parser.add_argument("--autostart", type=int, metavar="N",
+                        help="start the game as soon as N players have joined")
+    parser.add_argument("--countdown", action="store_true",
+                        help="show a countdown for each question (asyncio)")
+    parser.add_argument("--unsafe", action="store_true",
+                        help="DEMO ONLY: no lock around the scoring (race condition)")
+    args = parser.parse_args(argv)
+    if args.autostart is not None and not MIN_PLAYERS <= args.autostart <= args.max_players:
+        parser.error(f"--autostart must be between {MIN_PLAYERS} and --max-players")
+
     try:
-        loaded = load_questions(QUESTIONS_FILE)
+        questions = load_questions(QUESTIONS_FILE)
     except (OSError, ValueError) as exc:
         print(f"Cannot load {QUESTIONS_FILE}: {exc}")
         sys.exit(1)
-    print(f"{len(loaded)} questions loaded, log file: {LOG_FILE}")
-    QuizServer(questions=loaded, logger=GameLogger(LOG_FILE)).run()
+    print(f"{len(questions)} questions loaded, log file: {LOG_FILE}")
+    QuizServer(port=args.port, questions=questions, logger=GameLogger(LOG_FILE),
+               max_players=args.max_players, safe=not args.unsafe,
+               autostart=args.autostart,
+               display=HostDisplay() if args.countdown else None).run()
+
+
+if __name__ == "__main__":      # this guard is mandatory with multiprocessing (spawn)
+    main()
