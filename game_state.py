@@ -18,12 +18,13 @@ before the others are released. The actions below take the lock but never
 send anything.
 """
 
+import contextlib
 import json
 import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Dict, Iterable, List, NamedTuple, Optional
+from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
 
 from protocol import MessageChannel
 
@@ -33,6 +34,11 @@ MAX_NAME_LENGTH = 20
 
 POINTS_CORRECT = 100     # correct answer
 BONUS_FIRST = 50         # extra points for the first correct answer of a round
+
+# UNSAFE demo mode only: pause (seconds) placed between "check" and "write" in the
+# scoring, to make the race condition easy to see (the course example needed
+# thousands of iterations; here a tiny sleep is enough).
+RACE_DELAY = 0.001
 
 # A barrier gives up (BrokenBarrierError) after the longest question time limit
 # plus this margin. The margin must be larger than the time a client may need
@@ -137,15 +143,24 @@ class GameState:
     def __init__(self, questions: Optional[Iterable[Question]] = None,
                  min_players: int = MIN_PLAYERS, max_players: int = MAX_PLAYERS,
                  finished: Optional[threading.Event] = None,
-                 publish: Optional[Callable[[dict], None]] = None) -> None:
+                 publish: Optional[Callable[[dict], None]] = None,
+                 safe: bool = True) -> None:
         self._lock = threading.Lock()          # the ONE lock of the game
+        # Same lock: a Condition built on it adds no second lock. Used to wait
+        # for lobby changes without busy waiting.
+        self._lobby_changed = threading.Condition(self._lock)
         self._publish = publish                # sends an event to the logger process
+        # safe=False is the DEMO of the race condition: the critical section of
+        # submit_answer then runs without any lock.
+        self._safe = safe
+        self._scoring_guard = self._lock if safe else contextlib.nullcontext()
         self._min_players = min_players
         self._max_players = max_players
         self._questions: List[Question] = list(questions or [])
         self._finished = finished if finished is not None else threading.Event()
 
         self._players: Dict[int, Player] = {}  # player_id -> Player, in join order
+        self._ready: Set[int] = set()          # players who answered READY
         self._next_id = 1
         self._lobby_open = True
         self._lobby_version = 0
@@ -217,6 +232,7 @@ class GameState:
             self._players[player.player_id] = player
             self._next_id += 1
             self._lobby_version += 1
+            self._lobby_changed.notify_all()     # wake up wait_for_players()
             return player
 
     def remove_player(self, player_id: int) -> Leave:
@@ -233,6 +249,7 @@ class GameState:
             if self._lobby_open:
                 del self._players[player_id]
                 self._lobby_version += 1
+                self._lobby_changed.notify_all()
                 return Leave.REMOVED
             player.connected = False
             return Leave.GHOST
@@ -258,7 +275,42 @@ class GameState:
 
             self._lobby_open = False
             self._lobby_version += 1
+            self._lobby_changed.notify_all()
             return [p.name for p in self._players.values()]
+
+    def wait_for_players(self, count: int) -> bool:
+        """Block until `count` players are in the lobby. Used by --autostart.
+
+        Returns True if the count was reached while the lobby is still open,
+        False if the lobby was closed first (the host started the game).
+
+        Condition pattern from the course: the lock is held, wait() releases
+        it while sleeping, and the test is in a `while` (not an `if`), because
+        the state may have changed again when the thread wakes up.
+        """
+        with self._lobby_changed:
+            while self._lobby_open and len(self._players) < count:
+                self._lobby_changed.wait()
+            return self._lobby_open
+
+    def mark_ready(self, player_id: int) -> None:
+        """The player's client answered READY."""
+        with self._lock:
+            self._ready.add(player_id)
+
+    def unready_players(self) -> List[Tuple[str, MessageChannel]]:
+        """Connected players who did not answer READY (name, channel)."""
+        with self._lock:
+            return [(p.name, p.channel) for p in self._players.values()
+                    if p.connected and p.player_id not in self._ready]
+
+    def abort_game(self) -> None:
+        """Break both barriers: every worker waiting on one gets
+        BrokenBarrierError at once, instead of waiting for the barrier timeout.
+        Used when a worker thread crashes."""
+        for barrier in (self._start_barrier, self._end_barrier):
+            if barrier is not None:
+                barrier.abort()
 
     def lobby_snapshot(self) -> LobbySnapshot:
         """Copy of the lobby taken under the lock.
@@ -288,6 +340,10 @@ class GameState:
             self._answers = {}
             self._first_correct_id = None
             self._round_started = time.monotonic()
+            event = {"type": "round_start", "q": self._current.id,
+                     "number": self._next_index, "total": len(self._questions),
+                     "time_limit": self._current.time_limit}
+        self.publish_event(event)               # after the lock is released
 
     def _end_round(self) -> None:
         """Action of end_barrier: freeze the ranking for this round.
@@ -324,8 +380,11 @@ class GameState:
         two score updates could overwrite each other (lost update, like
         `cpt = cpt + 1`).
         The lock is released before the caller sends anything.
+
+        In the --unsafe demo the guard is NOT the lock, and a tiny pause widens
+        the gap between the check and the write (see _race_window).
         """
-        with self._lock:
+        with self._scoring_guard:
             question = self._current
             if question is None or question_id != question.id:
                 raise RoundError("wrong question")
@@ -342,6 +401,7 @@ class GameState:
             if correct:
                 points = POINTS_CORRECT
                 if self._first_correct_id is None:       # check ...
+                    self._race_window()                  # (no-op in safe mode)
                     self._first_correct_id = player_id   # ... and set, atomically
                     points += BONUS_FIRST
                     first = True
@@ -351,6 +411,13 @@ class GameState:
                                   time.monotonic() - self._round_started)
             self._answers[player_id] = result
             return result
+
+    def _race_window(self) -> None:
+        """UNSAFE demo only: sleep between "check" and "set" so that several
+        threads pass the check before any of them sets the marker, and several
+        players get the "first" bonus. In safe mode this does nothing."""
+        if not self._safe:
+            time.sleep(RACE_DELAY)
 
     def frozen_ranking(self) -> List[list]:
         """Ranking taken by the last end barrier action: [[name, score], ...]."""
