@@ -17,8 +17,8 @@ Threads of the server process:
 The shared data (players, scores, round data) lives in GameState, protected
 by ONE lock.
 
-Usage: python server.py [--port N] [--max-players N] [--autostart N]
-                        [--countdown] [--unsafe]
+Usage: python server.py [--port N] [--max-players N] [--questions N]
+                        [--autostart N] [--countdown] [--unsafe]
 """
 
 import argparse
@@ -29,8 +29,8 @@ import threading
 from typing import List, Optional
 
 import protocol as p
-from game_state import (MAX_PLAYERS, MIN_PLAYERS, GameState, LobbyError,
-                        Question, load_questions)
+from game_state import (MAX_PLAYERS, MIN_PLAYERS, QUESTIONS_PER_GAME, GameState,
+                        LobbyError, Question, load_questions, pick_questions)
 from host_display import HostDisplay
 from logger_process import GameLogger
 from worker import ClientWorker, broadcast_lobby
@@ -254,7 +254,8 @@ class QuizServer:
             return False
         broadcast_lobby(self._state)             # clients see that the lobby is closed
         self._publish({"type": "game_start", "players": names,
-                       "questions": self._state.total_rounds})
+                       "questions": self._state.total_rounds,
+                       "question_ids": self._state.question_ids})
         print(f"Lobby closed with {len(names)} players: {', '.join(names)}")
 
         self._ready_timer = threading.Timer(self._ready_timeout, self._kick_unready)
@@ -278,6 +279,9 @@ def main(argv=None) -> None:
     parser.add_argument("--port", type=int, default=p.PORT)
     parser.add_argument("--max-players", type=int, default=MAX_PLAYERS,
                         help=f"size of the lobby (default {MAX_PLAYERS})")
+    parser.add_argument("--questions", type=int, default=QUESTIONS_PER_GAME,
+                        help=f"questions drawn at random from the pool "
+                             f"(default {QUESTIONS_PER_GAME})")
     parser.add_argument("--autostart", type=int, metavar="N",
                         help="start the game as soon as N players have joined")
     parser.add_argument("--countdown", action="store_true",
@@ -289,11 +293,14 @@ def main(argv=None) -> None:
         parser.error(f"--autostart must be between {MIN_PLAYERS} and --max-players")
 
     try:
-        questions = load_questions(QUESTIONS_FILE)
+        pool = load_questions(QUESTIONS_FILE)
+        questions = pick_questions(pool, args.questions)    # random subset, random order
     except (OSError, ValueError) as exc:
-        print(f"Cannot load {QUESTIONS_FILE}: {exc}")
+        print(f"Cannot prepare the questions from {QUESTIONS_FILE}: {exc}")
         sys.exit(1)
-    print(f"{len(questions)} questions loaded, log file: {LOG_FILE}")
+    print(f"{len(pool)} questions in the pool, {len(questions)} drawn for this game "
+          f"(ids: {', '.join(str(q.id) for q in questions)})")
+    print(f"log file: {LOG_FILE}")
     QuizServer(port=args.port, questions=questions, logger=GameLogger(LOG_FILE),
                max_players=args.max_players, safe=not args.unsafe,
                autostart=args.autostart,
