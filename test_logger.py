@@ -198,6 +198,7 @@ class LoggedGameTest(unittest.TestCase):
         text = self.run_game(Bot(0, "Ali"), Bot(0, "Sana", delay=0.3))
         self.assertEqual(self.kinds(text, "join"), 2)
         self.assertEqual(self.kinds(text, "game_start"), 1)
+        self.assertIn("question_ids=1,2", text)                # which questions were asked
         self.assertEqual(self.kinds(text, "answer"), 4)        # 2 players x 2 questions
         self.assertEqual(self.kinds(text, "round_start"), 2)
         self.assertEqual(self.kinds(text, "round_end"), 2)
