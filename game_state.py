@@ -20,6 +20,7 @@ send anything.
 
 import contextlib
 import json
+import random
 import threading
 import time
 from dataclasses import dataclass
@@ -31,6 +32,8 @@ from protocol import MessageChannel
 MIN_PLAYERS = 2
 MAX_PLAYERS = 6
 MAX_NAME_LENGTH = 20
+
+QUESTIONS_PER_GAME = 15  # questions drawn from the pool for one game
 
 POINTS_CORRECT = 100     # correct answer
 BONUS_FIRST = 50         # extra points for the first correct answer of a round
@@ -97,6 +100,20 @@ def load_questions(path: str) -> List[Question]:
     if len({q.id for q in questions}) != len(questions):
         raise ValueError("question ids must be unique")
     return questions
+
+
+def pick_questions(pool: List[Question], count: int = QUESTIONS_PER_GAME,
+                   rng=random) -> List[Question]:
+    """Draw `count` different questions from the pool, in random order.
+
+    `rng` is the random module by default; a test can pass random.Random(seed)
+    to get a repeatable draw.
+    """
+    if count < 1:
+        raise ValueError("at least one question is needed")
+    if count > len(pool):
+        raise ValueError(f"only {len(pool)} questions in the pool, {count} requested")
+    return rng.sample(pool, count)
 
 
 @dataclass
@@ -181,6 +198,11 @@ class GameState:
     @property
     def total_rounds(self) -> int:
         return len(self._questions)            # never modified after __init__
+
+    @property
+    def question_ids(self) -> List[int]:
+        """Ids of the questions of this game, in the order they are asked."""
+        return [q.id for q in self._questions]
 
     @property
     def start_barrier(self) -> threading.Barrier:

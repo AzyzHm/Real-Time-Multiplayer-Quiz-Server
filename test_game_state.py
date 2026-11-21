@@ -1,10 +1,14 @@
 """Tests of game_state.py (run: python test_game_state.py)."""
 
+import os
+import random
 import threading
 import unittest
+from collections import Counter
 
-from game_state import (BONUS_FIRST, POINTS_CORRECT, GameState, Leave,
-                        LobbyError, Question, RoundError)
+from game_state import (BONUS_FIRST, POINTS_CORRECT, QUESTIONS_PER_GAME, GameState,
+                        Leave, LobbyError, Question, RoundError, load_questions,
+                        pick_questions)
 
 
 class LobbyTest(unittest.TestCase):
@@ -327,6 +331,74 @@ class EventsTest(unittest.TestCase):
                          (1, 2, 5))
         self.assertEqual(events[1]["ranking"], [["a", 150], ["b", 0]])
         self.assertEqual(events[2]["ranking"], [["a", 150], ["b", 0]])
+
+
+QUESTIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "questions.json")
+
+
+class PickQuestionsTest(unittest.TestCase):
+    POOL = [Question(i, f"Q{i}?", {"A": "a", "B": "b"}, "A", 15) for i in range(1, 51)]
+
+    def test_draws_the_requested_number_without_repeats(self) -> None:
+        picked = pick_questions(self.POOL, 15)
+        self.assertEqual(len(picked), 15)
+        self.assertEqual(len({q.id for q in picked}), 15)
+        self.assertTrue(all(q in self.POOL for q in picked))
+
+    def test_default_is_the_number_of_questions_per_game(self) -> None:
+        self.assertEqual(len(pick_questions(self.POOL)), QUESTIONS_PER_GAME)
+
+    def test_the_draw_is_random_but_repeatable_with_a_seed(self) -> None:
+        a = [q.id for q in pick_questions(self.POOL, 15, random.Random(1))]
+        b = [q.id for q in pick_questions(self.POOL, 15, random.Random(1))]
+        c = [q.id for q in pick_questions(self.POOL, 15, random.Random(2))]
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, c)
+
+    def test_the_pool_is_not_modified(self) -> None:
+        before = [q.id for q in self.POOL]
+        pick_questions(self.POOL, 15)
+        self.assertEqual([q.id for q in self.POOL], before)
+
+    def test_invalid_counts_are_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            pick_questions(self.POOL, 0)
+        with self.assertRaises(ValueError):
+            pick_questions(self.POOL, 51)
+
+    def test_game_state_knows_the_ids_in_asking_order(self) -> None:
+        picked = pick_questions(self.POOL, 5, random.Random(3))
+        self.assertEqual(GameState(picked).question_ids, [q.id for q in picked])
+
+
+class QuestionsFileTest(unittest.TestCase):
+    """Quality gate for questions.json: catches a typo in one of the questions."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.questions = load_questions(QUESTIONS_FILE)
+
+    def test_the_pool_is_large_enough(self) -> None:
+        self.assertEqual(len(self.questions), 50)
+        self.assertGreaterEqual(len(self.questions), QUESTIONS_PER_GAME)
+
+    def test_every_question_lasts_15_seconds(self) -> None:
+        self.assertEqual({q.time_limit for q in self.questions}, {15.0})
+
+    def test_every_question_has_four_distinct_choices_a_to_d(self) -> None:
+        for q in self.questions:
+            self.assertEqual(list(q.choices), ["A", "B", "C", "D"], q.id)
+            self.assertEqual(len(set(q.choices.values())), 4, f"question {q.id}")
+            self.assertIn(q.answer, q.choices)
+
+    def test_no_duplicated_question_text(self) -> None:
+        texts = [q.text for q in self.questions]
+        self.assertEqual(len(set(texts)), len(texts))
+
+    def test_right_answers_are_spread_over_the_four_letters(self) -> None:
+        counts = Counter(q.answer for q in self.questions)
+        for letter in "ABCD":
+            self.assertTrue(8 <= counts[letter] <= 17, counts)
 
 
 if __name__ == "__main__":
